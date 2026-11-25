@@ -38,7 +38,12 @@ def validate(s,p):
    n=sum(r.get(k)==t for r in rows.values())
    if n<c['coverage']:errors.append(f'{k} {t}: cobertura {n}/{c["coverage"]}')
  for op in s['operators']:
-  k=str(op['id']);r={**old.get(k,{}),**rows.get(k,{})};run=0;prev=None;week={}
+  k=str(op['id']);
+  for d in ds:
+   v=rows.get(k,{}).get(str(d)); active=op_at(op,d)['active']
+   if active and not v:errors.append(f'{op["name"]} {d}: falta asignación')
+   if not active and v:errors.append(f'{op["name"]} {d}: operador no disponible')
+  r={**old.get(k,{}),**rows.get(k,{})};run=0;prev=None;week={}
   for d in days(ds[0]-dt.timedelta(days=7),ds[-1]+dt.timedelta(days=7)):
    v=r.get(str(d)); work=v in ['T1','T2','T3'];run=run+1 if work else 0
    if work and run>c['maxrun'] and d>=ds[0]:errors.append(f'{op["name"]} {d}: exceso de días consecutivos')
@@ -50,21 +55,56 @@ def validate(s,p):
   for n in s['novelties']:
    if str(n['operator'])==k:
     for d in ds:
-     if n['start']<=str(d)<=n['end'] and rows.get(k,{}).get(str(d))!=n['type']:errors.append(f'{op["name"]} {d}: novedad no respetada')
+     if op_at(op,d)['active'] and n['start']<=str(d)<=n['end'] and rows.get(k,{}).get(str(d))!=n['type']:errors.append(f'{op["name"]} {d}: novedad no respetada')
  return errors
+
+def op_at(o,d):
+ state={'active':o.get('initial_active',o['active']),'group':o.get('initial_group',o['group'])}
+ if str(d)<o.get('entry','0001-01-01'):state['active']=False
+ for e in sorted(o.get('events',[]),key=lambda e:e['date']):
+  if e['date']<=str(d):state.update(e['changes'])
+ return state
+
+def operator_action(s,p):
+ today=dt.datetime.now(dt.timezone(dt.timedelta(hours=-5))).date(); kind=p.get('kind'); ops=s['operators']
+ def fail(msg):raise HTTPException(400,msg)
+ if kind in ('new','edit'):
+  name=str(p.get('name','')).strip();code=str(p.get('code','')).strip()
+  if not name or len(name)>150 or len(code)>80:fail('Nombre o código inválido')
+  if any(o['id']!=p.get('id') and (o['name'].casefold()==name.casefold() or (code and o.get('code','').casefold()==code.casefold())) for o in ops):fail('Nombre o código duplicado')
+ if kind=='new':
+  try:entry=date(p['date']);g=int(p['group'])
+  except (ValueError,KeyError,TypeError):fail('Fecha o grupo inválido')
+  if g not in range(3) or entry<today:fail('Grupo inválido o fecha histórica')
+  ops.append({'id':max([o['id'] for o in ops]+[0])+1,'name':name,'code':code,'group':g,'active':True,'entry':str(entry),'events':[]})
+  return
+ o=next((o for o in ops if o['id']==p.get('id')),None)
+ if not o:fail('Operador inexistente')
+ if kind=='edit':o.update(name=name,code=code);return
+ try:d=date(p['date'])
+ except (ValueError,KeyError,TypeError):fail('Fecha inválida')
+ if d<today or str(d)<o.get('entry','0001-01-01'):fail('Fecha histórica o anterior al ingreso')
+ if kind=='transfer':
+  g=p.get('group')
+  if g not in range(3):fail('Grupo inválido')
+  changes={'group':g}
+ elif kind in ('inactive','active'):changes={'active':kind=='active'}
+ else:fail('Acción inválida')
+ if any(v['end']>=str(d) and str(o['id']) in v['rows'] for v in s['versions']):fail('Existe programación publicada afectada; no se puede aplicar este movimiento todavía.')
+ o.setdefault('initial_group',o['group']);o.setdefault('initial_active',o['active']);o.setdefault('events',[]).append({'date':str(d),'changes':changes,'kind':kind,'recorded':dt.datetime.now(dt.timezone.utc).isoformat()})
 
 def generate(s,a,b):
  if b<a or (b-a).days>370:raise HTTPException(400,'Periodo inválido (máximo 371 días)')
- c=s['config']; start=a-dt.timedelta(days=a.weekday());end=b+dt.timedelta(days=6-b.weekday());ds=days(start,end);ops=[o for o in s['operators'] if o['active']];m=cp_model.CpModel();ts=['T1','T2','T3','DESC','NOV'];x={};nov={};old=published(s); penalties=[]
+ c=s['config']; start=a-dt.timedelta(days=a.weekday());end=b+dt.timedelta(days=6-b.weekday());ds=days(start,end);ops=[o for o in s['operators'] if any(op_at(o,d)['active'] for d in ds)];m=cp_model.CpModel();ts=['T1','T2','T3','DESC','NOV'];x={};nov={};old=published(s); penalties=[]
  for i,o in enumerate(ops):
   for j,d in enumerate(ds):
    for t in ts:x[i,j,t]=m.NewBoolVar(f'{i}_{j}_{t}')
    m.AddExactlyOne(x[i,j,t] for t in ts)
-   n=next((n['type'] for n in s['novelties'] if n['operator']==o['id'] and n['start']<=str(d)<=n['end']),None);nov[i,j]=n;m.Add(x[i,j,'NOV']==int(bool(n)))
+   n=next((n['type'] for n in s['novelties'] if n['operator']==o['id'] and n['start']<=str(d)<=n['end']),None);n=n if op_at(o,d)['active'] else 'INACTIVE';nov[i,j]=n;m.Add(x[i,j,'NOV']==int(bool(n)))
    if not a<=d<=b and str(d) in old.get(str(o['id']),{}):
     v=old[str(o['id'])][str(d)];m.Add(x[i,j,v if v in ts else 'NOV']==1)
    for t in ts[:3]:
-    if t!=base(d,o['group']):penalties.append(10*x[i,j,t])
+    if t!=base(d,op_at(o,d)['group']):penalties.append(10*x[i,j,t])
    if j:
     for t in ts[:3]:
      for u in ts[:3]:
@@ -79,7 +119,7 @@ def generate(s,a,b):
  if status==cp_model.UNKNOWN:raise HTTPException(503,'Tiempo de búsqueda agotado sin solución. Intente un periodo más corto.')
  if status==cp_model.INFEASIBLE:raise HTTPException(409,'Programación inviable con las reglas actuales. Revise novedades, disponibilidad y cobertura; considere incorporar operadores o ajustar descansos sin vulnerar las reglas obligatorias.')
  if status not in (cp_model.OPTIMAL,cp_model.FEASIBLE):raise HTTPException(500,'El optimizador no pudo procesar el modelo.')
- return {'start':str(a),'end':str(b),'rows':{str(o['id']):{str(d):next((nov[i,j] if t=='NOV' else t for t in ts if solver.Value(x[i,j,t])), 'DESC') for j,d in enumerate(ds) if a<=d<=b} for i,o in enumerate(ops)}}
+ return {'start':str(a),'end':str(b),'rows':{str(o['id']):{str(d):next((nov[i,j] if t=='NOV' else t for t in ts if solver.Value(x[i,j,t])), 'DESC') for j,d in enumerate(ds) if a<=d<=b and op_at(o,d)['active']} for i,o in enumerate(ops)}}
 @app.get('/')
 def home():return HTMLResponse(Path(__file__).with_name('index.html').read_text())
 @app.post('/login')
@@ -95,6 +135,11 @@ def data(r:Request):
  with engine.connect() as c:s=load(c)
  if r.session['role']!='admin':s={'operators':s['operators'],'config':s['config'],'published':published(s)}
  else:s['published']=published(s);s['errors']=validate(s,s['draft']) if s['draft'] else []
+ 
+ for o in s['operators']:
+  o.update(op_at(o,dt.datetime.now(dt.timezone(dt.timedelta(hours=-5))).date()))
+  if r.session['role']!='admin':
+   for k in ('events','code','initial_active','initial_group'):o.pop(k,None)
  s['role']=r.session['role'];return s
 def generate_and_save(p):
  if not generation_lock.acquire(blocking=False):raise HTTPException(409,'Ya hay una generación en curso')
@@ -131,7 +176,7 @@ async def action(action:str,r:Request):
    if errors:raise HTTPException(409,errors)
    s['versions'].append({**d,'published_at':dt.datetime.now(dt.timezone.utc).isoformat(),'reason':p.get('reason','')});s['draft']=None
   elif action=='delete_draft':s['draft']=None
-  elif action=='operators':s['operators']=p['items']
+  elif action=='operator':operator_action(s,p)
   elif action=='novelties':s['novelties']=p['items']
   elif action=='config':s['config']=p
   else:raise HTTPException(404)
