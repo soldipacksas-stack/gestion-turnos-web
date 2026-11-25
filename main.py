@@ -74,10 +74,11 @@ def generate(s,a,b):
   for j in range(0,len(ds),7):m.Add(sum(x[i,k,'DESC'] for k in range(j,j+7))==min(c['rest'],sum(not nov[i,k] for k in range(j,j+7))))
  for j,d in enumerate(ds):
   for t in ts[:3]:
-   shortage=m.NewIntVar(0,c['coverage'],f'short{j}{t}');m.Add(sum(x[i,j,t] for i in range(len(ops)))+shortage>=c['coverage']);penalties.append(10000*shortage)
+   m.Add(sum(x[i,j,t] for i in range(len(ops)))>=c['coverage'])
  m.Minimize(sum(penalties));solver=cp_model.CpSolver();solver.parameters.num_search_workers=1;solver.parameters.max_deterministic_time=12;solver.parameters.max_time_in_seconds=30;solver.parameters.random_seed=0;status=solver.Solve(m)
  if status==cp_model.UNKNOWN:raise HTTPException(503,'Tiempo de búsqueda agotado sin solución. Intente un periodo más corto.')
- if status not in (cp_model.OPTIMAL,cp_model.FEASIBLE):raise HTTPException(409,'No se encontró borrador: revise descansos, novedades y disponibilidad')
+ if status==cp_model.INFEASIBLE:raise HTTPException(409,'Programación inviable con las reglas actuales. Revise novedades, disponibilidad y cobertura; considere incorporar operadores o ajustar descansos sin vulnerar las reglas obligatorias.')
+ if status not in (cp_model.OPTIMAL,cp_model.FEASIBLE):raise HTTPException(500,'El optimizador no pudo procesar el modelo.')
  return {'start':str(a),'end':str(b),'rows':{str(o['id']):{str(d):next((nov[i,j] if t=='NOV' else t for t in ts if solver.Value(x[i,j,t])), 'DESC') for j,d in enumerate(ds) if a<=d<=b} for i,o in enumerate(ops)}}
 @app.get('/')
 def home():return HTMLResponse(Path(__file__).with_name('index.html').read_text())
@@ -101,6 +102,8 @@ def generate_and_save(p):
   with engine.connect() as c:s=load(c)
   snapshot=json.dumps(s,sort_keys=True)
   draft=generate(s,date(p['start']),date(p['end']))
+  errors=validate(s,draft)
+  if errors:raise HTTPException(409,'El borrador no supera la validación: '+ '; '.join(errors[:10])+'. Revise los límites del periodo y la programación publicada.')
   with engine.begin() as c:
    if engine.dialect.name=='postgresql':c.execute(text('SELECT id FROM state WHERE id=1 FOR UPDATE'))
    current=load(c)
