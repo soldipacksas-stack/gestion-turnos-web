@@ -47,15 +47,15 @@ def validate(s,p):
    v=rows.get(k,{}).get(str(d)); active=op_at(op,d)['active']
    if active and not v:errors.append(f'{op["name"]} {d}: falta asignación')
    if not active and v:errors.append(f'{op["name"]} {d}: operador no disponible')
-  r={**old.get(k,{}),**rows.get(k,{})};run=0;prev=None;week={}
+  r={**{day:v for day,v in old.get(k,{}).items() if not p['start']<=day<=p['end']},**rows.get(k,{})};run=0;prev=None;week={}
   for d in days(ds[0]-dt.timedelta(days=7),ds[-1]+dt.timedelta(days=7)):
    v=r.get(str(d)); work=v in ['T1','T2','T3'];run=run+1 if work else 0
    if work and run>c['maxrun'] and d>=ds[0]:errors.append(f'{op["name"]} {d}: exceso de días consecutivos')
-   if work and prev and gap(c,prev,v)<c['gap']*60 and d>=ds[0]:errors.append(f'{op["name"]} {d}: descanso insuficiente')
-   prev=v if work else None
+   if work and prev and gap(c,prev[1],v)+1440*((d-prev[0]).days-1)<c['gap']*60 and d>=ds[0] and prev[0]<=ds[-1]:errors.append(f'{op["name"]} {d}: descanso insuficiente')
+   if work:prev=(d,v)
    week.setdefault(d-dt.timedelta(days=d.weekday()),[]).append(v)
   for w,vs in week.items():
-   if len(vs)==7 and None not in vs and w<=ds[-1] and w+dt.timedelta(days=6)>=ds[0] and vs.count('DESC')!=c['rest'] and all(v in ['T1','T2','T3','DESC'] for v in vs):errors.append(f'{op["name"]} semana {w}: descansos incorrectos')
+   if len(vs)==7 and None not in vs and w<=ds[-1] and w+dt.timedelta(days=6)>=ds[0] and vs.count('DESC')!=min(c['rest'],sum(v in ('T1','T2','T3','DESC') for v in vs)):errors.append(f'{op["name"]} semana {w}: descansos incorrectos')
   for n in s['novelties']:
    if str(n['operator'])==k:
     for d in ds:
@@ -198,6 +198,7 @@ async def action(action:str,r:Request):
   elif action=='operator':operator_action(s,p)
   elif action=='novelties':update_novelties(s,p['items'])
   elif action=='swap':swap(s,p)
+  elif action=='replacement':apply_replacement(s,p)
   elif action=='config':
    validate_config(p);s.setdefault('config_history',[]).append({'date':str(today()),'config':copy.deepcopy(s['config'])});s['config']=p
   else:raise HTTPException(404)
@@ -217,6 +218,18 @@ def update_novelties(s,items):
   for other in items[:i]:
    if other['operator']==n['operator'] and other['start']<=n['end'] and n['start']<=other['end']:raise HTTPException(409,f"Conflicto con {other['type']} del {other['start']} al {other['end']}")
  d=s['draft']
+ if not d:
+  affected=[n for n in old+items if n not in old or n not in items]
+  pub=published(s)
+  dates_affected=[day for n in affected for day in pub.get(str(n['operator']),{}) if n['start']<=day<=n['end'] and day>=str(today())]
+  if dates_affected:
+   a,b=min(dates_affected),max(dates_affected)
+   a=max(str(today()),str(date(a)-dt.timedelta(days=date(a).weekday())))
+   b=str(date(b)+dt.timedelta(days=6-date(b).weekday()))
+   known=sorted({day for row in pub.values() for day in row if a<=day<=b})
+   if known:
+    a,b=known[0],known[-1]
+    d=s['draft']={'start':a,'end':b,'rows':{k:{day:v for day,v in row.items() if a<=day<=b} for k,row in pub.items()}}
  if d:
   backup=d.setdefault('before_novelties',{})
   for k,row in d['rows'].items():
@@ -250,3 +263,56 @@ def validate_config(p):
   for a,b in p['shifts']:
    dt.time.fromisoformat(a);dt.time.fromisoformat(b);assert a!=b
  except (ValueError,TypeError,KeyError,AssertionError):raise HTTPException(400,'Horarios inválidos')
+
+
+WORK=('T1','T2','T3')
+def replacement_options(s):
+ d=s.get('draft')
+ if not d:return []
+ rows=d['rows']; c=s['config']; baseline=set(validate(s,d)); out=[]
+ for day in days(max(today(),date(d['start'])),date(d['end'])):
+  k=str(day)
+  for t in WORK:
+   count=sum(r.get(k)==t for r in rows.values())
+   if count>=c['coverage']:continue
+   candidates=[]
+   absent_groups={op_at(o,day)['group'] for o in s['operators'] if d.get('before_novelties',{}).get(str(o['id'])+'|'+k)==t}
+   for o in s['operators']:
+    oid=str(o['id']); row=rows.get(oid,{}); prev=row.get(k)
+    if not op_at(o,day)['active'] or prev not in (*WORK,'DESC') or prev==t:continue
+    plans=[]
+    if prev in WORK and sum(r.get(k)==prev for r in rows.values())>c['coverage']:
+     plans.append([(k,prev,t)])
+    if prev=='DESC':
+     monday=day-dt.timedelta(days=day.weekday())
+     for other in days(monday,monday+dt.timedelta(days=6)):
+      q=str(other); v=row.get(q)
+      if other>=today() and v in WORK and sum(r.get(q)==v for r in rows.values())>c['coverage']:
+       plans.append([(k,prev,t),(q,v,'DESC')])
+    for plan in plans:
+     for q,old,new in plan:row[q]=new
+     try: errors=set(validate(s,d))
+     finally:
+      for q,old,new in plan:row[q]=old
+     if errors-baseline:continue
+     candidates.append({'operator':o['id'],'name':o['name'],'group':op_at(o,day)['group']+1,'same':op_at(o,day)['group'] in absent_groups,'changes':plan})
+   candidates.sort(key=lambda x:(not x['same'],len(x['changes']),x['operator']))
+   out.append({'date':k,'shift':t,'count':count,'required':c['coverage'],'options':candidates[:12]})
+ return out
+
+@app.get('/replacements')
+def replacements(r:Request):
+ admin(r)
+ with engine.connect() as c:s=load(c)
+ return replacement_options(s)
+
+def apply_replacement(s,p):
+ for issue in replacement_options(s):
+  if issue['date']==p.get('date') and issue['shift']==p.get('shift'):
+   for option in issue['options']:
+    if option['operator']==p.get('operator') and option['changes']==[tuple(x) for x in p.get('changes',[])]:
+     row=s['draft']['rows'][str(option['operator'])]
+     for day,old,new in option['changes']:row[day]=new
+     s['draft'].setdefault('replacements',[]).append({**option,'recorded':dt.datetime.now(dt.timezone.utc).isoformat()})
+     return
+ raise HTTPException(409,'La sugerencia ya no es válida. Consulte nuevamente.')
