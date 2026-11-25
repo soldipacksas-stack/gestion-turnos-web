@@ -1,4 +1,4 @@
-import os,json,datetime as dt, secrets, hmac, threading
+import copy,os,json,datetime as dt, secrets, hmac, threading
 from starlette.concurrency import run_in_threadpool
 from fastapi import FastAPI,Request,HTTPException
 from fastapi.responses import HTMLResponse
@@ -19,6 +19,7 @@ with engine.begin() as c:
 def load(c):return json.loads(c.execute(text('SELECT payload FROM state WHERE id=1')).scalar_one())
 def admin(r):
  if r.session.get('role')!='admin':raise HTTPException(403,'Acceso administrativo requerido')
+def today():return dt.datetime.now(dt.timezone(dt.timedelta(hours=-5))).date()
 def date(s):return dt.date.fromisoformat(s)
 def days(a,b):return [a+dt.timedelta(days=i) for i in range((b-a).days+1)]
 def base(d,g):return ['T1','T3','T2'][((d-date('2026-11-23')).days//7+[0,2,1][g%3])%3]
@@ -28,6 +29,9 @@ def gap(c,a,b):
 def published(s):
  out={}
  for v in s['versions']:
+  for row in out.values():
+   for day in list(row):
+    if v['start']<=day<=v['end']:row.pop(day)
   for k,row in v['rows'].items():out.setdefault(k,{}).update(row)
  return out
 def validate(s,p):
@@ -80,7 +84,8 @@ def operator_action(s,p):
   return
  o=next((o for o in ops if o['id']==p.get('id')),None)
  if not o:fail('Operador inexistente')
- if kind=='edit':o.update(name=name,code=code);return
+ if kind=='edit':
+  o.setdefault('events',[]).append({'date':str(today),'kind':'edit','changes':{},'before':{'name':o['name'],'code':o.get('code','')},'after':{'name':name,'code':code}});o.update(name=name,code=code);return
  try:d=date(p['date'])
  except (ValueError,KeyError,TypeError):fail('Fecha inválida')
  if d<today or str(d)<o.get('entry','0001-01-01'):fail('Fecha histórica o anterior al ingreso')
@@ -91,7 +96,7 @@ def operator_action(s,p):
  elif kind in ('inactive','active'):changes={'active':kind=='active'}
  else:fail('Acción inválida')
  if any(v['end']>=str(d) and str(o['id']) in v['rows'] for v in s['versions']):fail('Existe programación publicada afectada; no se puede aplicar este movimiento todavía.')
- o.setdefault('initial_group',o['group']);o.setdefault('initial_active',o['active']);o.setdefault('events',[]).append({'date':str(d),'changes':changes,'kind':kind,'recorded':dt.datetime.now(dt.timezone.utc).isoformat()})
+ o.setdefault('initial_group',o['group']);o.setdefault('initial_active',o['active']);o.setdefault('events',[]).append({'date':str(d),'changes':changes,'kind':kind,'before':op_at(o,d),'recorded':dt.datetime.now(dt.timezone.utc).isoformat()})
 
 def generate(s,a,b):
  if b<a or (b-a).days>370:raise HTTPException(400,'Periodo inválido (máximo 371 días)')
@@ -115,6 +120,19 @@ def generate(s,a,b):
  for j,d in enumerate(ds):
   for t in ts[:3]:
    m.Add(sum(x[i,j,t] for i in range(len(ops)))>=c['coverage'])
+ # Equidad acumulada: minimizar diferencias de descansos por categoría.
+ for category in ('sat','sun','holiday'):
+  counts=[]
+  for i,o in enumerate(ops):
+   def match(d):return d.weekday()==5 if category=='sat' else d.weekday()==6 if category=='sun' else d in holidays.Colombia(years=d.year)
+   prior=sum(v=='DESC' and date(k)<a and date(k).year==a.year and match(date(k)) for k,v in old.get(str(o['id']),{}).items())
+   count=m.NewIntVar(0,800,f'eq_{category}_{i}');m.Add(count==prior+sum(x[i,j,'DESC'] for j,d in enumerate(ds) if a<=d<=b and match(d)));counts.append(count)
+  if counts:
+   hi=m.NewIntVar(0,800,'hi_'+category);lo=m.NewIntVar(0,800,'lo_'+category);m.AddMaxEquality(hi,counts);m.AddMinEquality(lo,counts);penalties.append(8*(hi-lo))
+ for j,d in enumerate(ds):
+  if a<=d<=b:
+   counts=[sum(x[i,j,t] for i in range(len(ops))) for t in ts[:3]]
+   hi=m.NewIntVar(0,len(ops),f'hi{j}');lo=m.NewIntVar(0,len(ops),f'lo{j}');m.AddMaxEquality(hi,counts);m.AddMinEquality(lo,counts);penalties.append(hi-lo)
  m.Minimize(sum(penalties));solver=cp_model.CpSolver();solver.parameters.num_search_workers=1;solver.parameters.max_deterministic_time=12;solver.parameters.max_time_in_seconds=30;solver.parameters.random_seed=0;status=solver.Solve(m)
  if status==cp_model.UNKNOWN:raise HTTPException(503,'Tiempo de búsqueda agotado sin solución. Intente un periodo más corto.')
  if status==cp_model.INFEASIBLE:raise HTTPException(409,'Programación inviable con las reglas actuales. Revise novedades, disponibilidad y cobertura; considere incorporar operadores o ajustar descansos sin vulnerar las reglas obligatorias.')
@@ -167,18 +185,68 @@ async def action(action:str,r:Request):
   if action=='edit':
    d=s['draft'];k=str(p['operator']);day=p['date'];v=p['value'];
    if not d or k not in d['rows'] or day not in d['rows'][k] or v not in ['T1','T2','T3','DESC','VAC','INC','PER','LIC','CAP','AUS']:raise HTTPException(400,'Celda inválida')
+   if date(day)<today():raise HTTPException(400,'Fecha histórica bloqueada')
    d['rows'][k][day]=v
   elif action=='publish':
    d=s['draft'];
    if not d:raise HTTPException(400,'Sin borrador')
-   if date(d['start'])<dt.date.today():raise HTTPException(400,'Periodo histórico bloqueado')
+   if date(d['start'])<today():raise HTTPException(400,'Periodo histórico bloqueado')
    errors=validate(s,d)
    if errors:raise HTTPException(409,errors)
-   s['versions'].append({**d,'published_at':dt.datetime.now(dt.timezone.utc).isoformat(),'reason':p.get('reason','')});s['draft']=None
+   s['versions'].append({**d,'published_at':dt.datetime.now(dt.timezone.utc).isoformat(),'reason':p.get('reason',''),'config':copy.deepcopy(s['config']),'operators':copy.deepcopy(s['operators'])});s['draft']=None
   elif action=='delete_draft':s['draft']=None
   elif action=='operator':operator_action(s,p)
-  elif action=='novelties':s['novelties']=p['items']
-  elif action=='config':s['config']=p
+  elif action=='novelties':update_novelties(s,p['items'])
+  elif action=='swap':swap(s,p)
+  elif action=='config':
+   validate_config(p);s.setdefault('config_history',[]).append({'date':str(today()),'config':copy.deepcopy(s['config'])});s['config']=p
   else:raise HTTPException(404)
   c.execute(text('UPDATE state SET payload=:p WHERE id=1'),{'p':json.dumps(s)})
  return {'ok':True}
+
+
+def update_novelties(s,items):
+ if not isinstance(items,list):raise HTTPException(400,'Lista inválida')
+ old=s['novelties']; historical=lambda n:date(n['start'])<today()
+ if [n for n in old if historical(n)]!=[n for n in items if historical(n)]:raise HTTPException(400,'Novedades históricas protegidas')
+ for i,n in enumerate(items):
+  if n['type'] not in ('VAC','INC','PER','LIC','CAP','AUS') or date(n['start'])>date(n['end']):raise HTTPException(400,'Novedad o fechas inválidas')
+  o=next((o for o in s['operators'] if o['id']==n['operator']),None)
+  if not o:raise HTTPException(400,'Operador inexistente')
+  if n not in old and not all(op_at(o,d)['active'] for d in days(date(n['start']),date(n['end']))):raise HTTPException(400,'Operador no disponible en el periodo')
+  for other in items[:i]:
+   if other['operator']==n['operator'] and other['start']<=n['end'] and n['start']<=other['end']:raise HTTPException(409,f"Conflicto con {other['type']} del {other['start']} al {other['end']}")
+ d=s['draft']
+ if d:
+  backup=d.setdefault('before_novelties',{})
+  for k,row in d['rows'].items():
+   for day,v in list(row.items()):
+    n=next((n for n in items if str(n['operator'])==k and n['start']<=day<=n['end']),None)
+    key=k+'|'+day
+    if n:
+     if v in ('T1','T2','T3','DESC'):backup[key]=v
+     row[day]=n['type']
+    elif key in backup:row[day]=backup.pop(key)
+ s['novelties']=items
+
+def swap(s,p):
+ d=s['draft']
+ if not d:raise HTTPException(400,'Genere un borrador primero')
+ a,b=str(p['a']),str(p['b']);x,y=p['x'],p['y']
+ if min(date(x),date(y))<today():raise HTTPException(400,'Fecha histórica bloqueada')
+ try:u,v=d['rows'][a][x],d['rows'][b][y]
+ except KeyError:raise HTTPException(400,'Asignación inexistente')
+ if u not in ('T1','T2','T3','DESC') or v not in ('T1','T2','T3','DESC'):raise HTTPException(400,'No se intercambian novedades')
+ d['rows'][a][x],d['rows'][b][y]=v,u
+ errors=validate(s,d)
+ if errors:raise HTTPException(409,errors[:20])
+ s.setdefault('swaps',[]).append({'a':a,'b':b,'x':x,'y':y,'before':[u,v],'after':[v,u],'reason':str(p.get('reason','')),'recorded':dt.datetime.now(dt.timezone.utc).isoformat()})
+
+def validate_config(p):
+ for k,lo,hi in [('coverage',1,100),('rest',0,6),('gap',0,48),('maxrun',1,14),('alerts',1,365)]:
+  if type(p.get(k)) is not int or not lo<=p[k]<=hi:raise HTTPException(400,'Parámetro inválido: '+k)
+ try:
+  assert len(p['shifts'])==3
+  for a,b in p['shifts']:
+   dt.time.fromisoformat(a);dt.time.fromisoformat(b);assert a!=b
+ except (ValueError,TypeError,KeyError,AssertionError):raise HTTPException(400,'Horarios inválidos')
