@@ -1,4 +1,5 @@
-import os,json,datetime as dt, secrets, hmac
+import os,json,datetime as dt, secrets, hmac, threading
+from starlette.concurrency import run_in_threadpool
 from fastapi import FastAPI,Request,HTTPException
 from fastapi.responses import HTMLResponse
 from starlette.middleware.sessions import SessionMiddleware
@@ -9,6 +10,7 @@ from pathlib import Path
 app=FastAPI(); app.add_middleware(SessionMiddleware,secret_key=os.environ.get('SESSION_SECRET',secrets.token_hex(32)),https_only=bool(os.getenv('RENDER')))
 url=os.getenv('DATABASE_URL','sqlite:///turnos.db').replace('postgres://','postgresql+psycopg://',1).replace('postgresql://','postgresql+psycopg://',1)
 engine=create_engine(url)
+generation_lock=threading.Lock()
 NAMES=[f'Operador {i:02d}' for i in range(1,13)]
 DEFAULT={'operators':[{'id':i+1,'name':n,'group':i//4,'active':True} for i,n in enumerate(NAMES)],'config':{'coverage':2,'rest':2,'gap':12,'maxrun':6,'alerts':15,'shifts':[['05:30','14:00'],['13:30','22:00'],['21:30','06:00']]},'novelties':[],'draft':None,'versions':[]}
 with engine.begin() as c:
@@ -73,7 +75,8 @@ def generate(s,a,b):
  for j,d in enumerate(ds):
   for t in ts[:3]:
    shortage=m.NewIntVar(0,c['coverage'],f'short{j}{t}');m.Add(sum(x[i,j,t] for i in range(len(ops)))+shortage>=c['coverage']);penalties.append(10000*shortage)
- m.Minimize(sum(penalties));solver=cp_model.CpSolver();solver.parameters.num_search_workers=1;solver.parameters.max_deterministic_time=12;solver.parameters.random_seed=0;status=solver.Solve(m)
+ m.Minimize(sum(penalties));solver=cp_model.CpSolver();solver.parameters.num_search_workers=1;solver.parameters.max_deterministic_time=12;solver.parameters.max_time_in_seconds=30;solver.parameters.random_seed=0;status=solver.Solve(m)
+ if status==cp_model.UNKNOWN:raise HTTPException(503,'Tiempo de búsqueda agotado sin solución. Intente un periodo más corto.')
  if status not in (cp_model.OPTIMAL,cp_model.FEASIBLE):raise HTTPException(409,'No se encontró borrador: revise descansos, novedades y disponibilidad')
  return {'start':str(a),'end':str(b),'rows':{str(o['id']):{str(d):next((nov[i,j] if t=='NOV' else t for t in ts if solver.Value(x[i,j,t])), 'DESC') for j,d in enumerate(ds) if a<=d<=b} for i,o in enumerate(ops)}}
 @app.get('/')
@@ -92,14 +95,28 @@ def data(r:Request):
  if r.session['role']!='admin':s={'operators':s['operators'],'config':s['config'],'published':published(s)}
  else:s['published']=published(s);s['errors']=validate(s,s['draft']) if s['draft'] else []
  s['role']=r.session['role'];return s
+def generate_and_save(p):
+ if not generation_lock.acquire(blocking=False):raise HTTPException(409,'Ya hay una generación en curso')
+ try:
+  with engine.connect() as c:s=load(c)
+  snapshot=json.dumps(s,sort_keys=True)
+  draft=generate(s,date(p['start']),date(p['end']))
+  with engine.begin() as c:
+   if engine.dialect.name=='postgresql':c.execute(text('SELECT id FROM state WHERE id=1 FOR UPDATE'))
+   current=load(c)
+   if json.dumps(current,sort_keys=True)!=snapshot:raise HTTPException(409,'Los datos cambiaron durante la generación. Intente nuevamente.')
+   current['draft']=draft
+   c.execute(text('UPDATE state SET payload=:p WHERE id=1'),{'p':json.dumps(current)})
+  return {'ok':True}
+ finally:generation_lock.release()
 @app.post('/action/{action}')
 async def action(action:str,r:Request):
  admin(r);p=await r.json()
+ if action=='generate':return await run_in_threadpool(generate_and_save,p)
  with engine.begin() as c:
   if engine.dialect.name=='postgresql':c.execute(text('SELECT id FROM state WHERE id=1 FOR UPDATE'))
   s=load(c)
-  if action=='generate':s['draft']=generate(s,date(p['start']),date(p['end']))
-  elif action=='edit':
+  if action=='edit':
    d=s['draft'];k=str(p['operator']);day=p['date'];v=p['value'];
    if not d or k not in d['rows'] or day not in d['rows'][k] or v not in ['T1','T2','T3','DESC','VAC','INC','PER','LIC','CAP','AUS']:raise HTTPException(400,'Celda inválida')
    d['rows'][k][day]=v
